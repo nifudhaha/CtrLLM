@@ -1,10 +1,4 @@
-# ctrLLM
 
-**Controversial Topic Representation in LLM**
-
-A comprehensive Python package for analyzing text diversity, bias, and controversial topic representation in language models.
-
----
 
 # ctrLLM
 
