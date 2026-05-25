@@ -1,264 +1,381 @@
-"""
-Argument Analysis Module
-Contains metrics related to argument detection, clustering, and diversity
-
-Uses LLM-based argument detection for high accuracy.
-"""
-
 import os
-import json
-import time
 import numpy as np
-from typing import List, Dict, Optional
-from collections import Counter
+import pandas as pd
+from typing import List, Dict, Optional, Union
 from sentence_transformers import SentenceTransformer
-from sklearn.cluster import DBSCAN, KMeans
-import stanza
+import hdbscan
 
-# OpenAI for LLM-based detection
+# WIBA for argument detection
 try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
+    from wiba import WIBA
+    WIBA_AVAILABLE = True
 except ImportError:
-    OPENAI_AVAILABLE = False
+    WIBA_AVAILABLE = False
 
-# LLM Prompt for argument detection
-ARGUMENT_DETECTION_PROMPT = """You are an annotator for argument detection.
+# UMAP for dimensionality reduction
+try:
+    import umap
+    UMAP_AVAILABLE = True
+except ImportError:
+    UMAP_AVAILABLE = False
 
-Task:
-Definition (must satisfy BOTH):
-  1) At least one SUBJECTIVE claim/conclusion (opinion, evaluation, stance), AND
-  2) At least one supporting sentence giving REASONING, PREMISE, or EVIDENCE
-     (objective info, reliable facts, or commonsense knowledge).
 
-Notes:
-- Pure descriptions of facts without a stance are NOT arguments.
-- Pure rhetorical questions without support are NOT arguments.
-- A single subjective claim WITHOUT explicit support is NOT an argument.
-- Output STRICT JSON with fields:
-  - is_argument (boolean)
-  - explanation (string)  # briefly justify your decision
-"""
+# WIBA hard limit per API call
+WIBA_MAX_CHARS = 9_000   
 
 
 class ArgumentAnalyzer:
-    """
-    Analyzes argument-related properties of text including:
-    - Argument detection (LLM-based)
-    - Argument clustering
-    - Argument diversity
-    - Main vs. Fringe perspective
-    - Argument distinctness
-    """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  lang: str = "en",
-                 embedding_model: str = "all-MiniLM-L6-v2",
+                 embedding_model: str = "all-mpnet-base-v2",
                  min_cluster_size: int = 2,
-                 llm_model: str = "gpt-4o-mini",
-                 llm_temperature: float = 1.0):
-        """
-        Initialize argument analyzer.
-        
-        Args:
-            lang: Language code for Stanza (used for sentence tokenization)
-            embedding_model: SentenceTransformer model name
-            min_cluster_size: Minimum size for a valid cluster
-            llm_model: OpenAI model name for argument detection
-            llm_temperature: Temperature for LLM (0.0-2.0)
-        """
-        # Check LLM availability
-        if not OPENAI_AVAILABLE:
+                 min_samples: int = 1,
+                 cluster_selection_epsilon: float = 0.0,
+                 use_umap: bool = True,
+                 umap_n_neighbors: int = 15,
+                 umap_min_dist: float = 0.1,
+                 umap_metric: str = 'cosine',
+                 wiba_token: Optional[str] = None):
+
+        if not WIBA_AVAILABLE:
             raise ImportError(
-                "OpenAI package not installed. "
-                "Install with: pip install openai"
+                "WIBA package not installed. "
+                "Install with: pip install wiba"
             )
-        if not os.getenv("OPENAI_API_KEY"):
+
+        if use_umap and not UMAP_AVAILABLE:
+            raise ImportError(
+                "UMAP package not installed. "
+                "Install with: pip install umap-learn"
+            )
+
+        self.lang = lang
+
+        # Setup WIBA
+        token = wiba_token or os.getenv("WIBA_API_TOKEN")
+        if not token:
             raise ValueError(
-                "OPENAI_API_KEY environment variable not set. "
-                "Set it with: export OPENAI_API_KEY='your-key-here'"
+                "WIBA_API_TOKEN not provided. "
+                "Set it with: export WIBA_API_TOKEN='your-token' or pass wiba_token parameter"
             )
-        
-        # NLP processing (for sentence tokenization)
-        try:
-            self.nlp = stanza.Pipeline(
-                lang=lang,
-                processors='tokenize',
-                download_method=None
-            )
-        except Exception:
-            print(f"Downloading Stanza {lang} models...")
-            stanza.download(lang)
-            self.nlp = stanza.Pipeline(
-                lang=lang,
-                processors='tokenize'
-            )
-        
+        self.wiba_client = WIBA(api_token=token)
+
+        # Setup embedding model
         self.embedding_model = SentenceTransformer(embedding_model)
+
+        # HDBSCAN parameters
         self.min_cluster_size = min_cluster_size
-        
-        # LLM setup
-        self.llm_model = llm_model
-        self.llm_temperature = llm_temperature
-        self.llm_client = OpenAI()
-        self.llm_cache: Dict[str, Dict] = {}
-        
-        print(f"ArgumentAnalyzer initialized with LLM model: {llm_model}")
-        
-        self.doc = None
-        self.sentences = []
+        self.min_samples = min_samples
+        self.cluster_selection_epsilon = cluster_selection_epsilon
+
+        # UMAP parameters
+        self.use_umap = use_umap
+        self.umap_n_neighbors = umap_n_neighbors
+        self.umap_min_dist = umap_min_dist
+        self.umap_metric = umap_metric
+
+        print(f"ArgumentAnalyzer initialized with WIBA + HDBSCAN" + (" + UMAP" if use_umap else ""))
+        print(f"  Language: {lang}")
+        print(f"  Embedding model: {embedding_model}")
+        print(f"  HDBSCAN min_cluster_size: {min_cluster_size}")
+        if use_umap:
+            print(f"  UMAP enabled: n_neighbors={umap_n_neighbors}, min_dist={umap_min_dist}")
+
+        # State variables
         self.arguments = []
         self.argument_embeddings = None
+        self.umap_embeddings = None
+        self.umap_reducer = None
         self.clusters = None
         self.cluster_labels = None
-        
+        self.clusterer = None
+        self._current_text = None
+        self._wiba_results_df = None  # Store full WIBA results for downstream use
+
+
+    def discover_arguments(self,
+                           data: Union[str, pd.DataFrame],
+                           text_column: Optional[str] = None,
+                           window_size: int = 3,
+                           step_size: int = 1) -> pd.DataFrame:
+
+        if isinstance(data, str):
+            return self._discover_arguments_from_text(data, window_size, step_size)
+
+        elif isinstance(data, pd.DataFrame):
+            if text_column is None:
+                raise ValueError("text_column must be specified when data is DataFrame")
+
+            all_results = []
+            for idx, row in data.iterrows():
+                text = row[text_column]
+                result_df = self._discover_arguments_from_text(text, window_size, step_size)
+                result_df['source_index'] = idx
+                all_results.append(result_df)
+
+            return pd.concat(all_results, ignore_index=True)
+
+        else:
+            raise ValueError("data must be either str or pandas DataFrame")
+
+
+    @staticmethod
+    def _chunk_text(text: str, max_chars: int = WIBA_MAX_CHARS) -> List[str]:
+
+        import re
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        chunks, current, current_len = [], [], 0
+
+        for sent in sentences:
+            sent_len = len(sent) + 1          # +1 for the space we'll rejoin with
+            if current and current_len + sent_len > max_chars:
+                chunks.append(' '.join(current))
+                current, current_len = [], 0
+            current.append(sent)
+            current_len += sent_len
+
+        if current:
+            chunks.append(' '.join(current))
+
+        return chunks
+
+    def _discover_arguments_from_text(self,
+                                       text: str,
+                                       window_size: int,
+                                       step_size: int) -> pd.DataFrame:
+
+        empty_df = pd.DataFrame(columns=[
+            "text_segment", "is_argument", "argument_confidence",
+            "claims", "premises",
+            "topic_fine", "topic_broad",
+            "stance_fine", "stance_broad",
+            "argument_type", "argument_scheme",
+        ])
+
+        # -- Split into WIBA-safe chunks if needed --
+        if len(text) > WIBA_MAX_CHARS:
+            chunks = self._chunk_text(text, WIBA_MAX_CHARS)
+            print(f"Text is {len(text):,} chars — splitting into {len(chunks)} chunks "
+                  f"(≤{WIBA_MAX_CHARS:,} chars each) for WIBA...")
+        else:
+            chunks = [text]
+
+        all_chunk_dfs = []
+        for i, chunk in enumerate(chunks):
+            if len(chunks) > 1:
+                print(f"  Chunk {i+1}/{len(chunks)} ({len(chunk):,} chars) — "
+                      f"calling WIBA discover_arguments() "
+                      f"(window_size={window_size}, step_size={step_size})...")
+            else:
+                print(f"Calling WIBA discover_arguments() "
+                      f"(window_size={window_size}, step_size={step_size})...")
+
+            try:
+                raw_df = self.wiba_client.discover_arguments(
+                    chunk,
+                    window_size=window_size,
+                    step_size=step_size,
+                )
+            except Exception as e:
+                print(f"  Warning: WIBA discover_arguments() failed on chunk {i+1}: {e}")
+                continue   # skip this chunk, try the rest
+
+            if raw_df is not None and len(raw_df) > 0:
+                all_chunk_dfs.append(raw_df)
+
+        if not all_chunk_dfs:
+            print("Warning: all WIBA chunks failed or returned empty results.")
+            return empty_df
+
+        # Concatenate chunks
+        raw_df = pd.concat(all_chunk_dfs, ignore_index=True)
+
+        if raw_df is None or len(raw_df) == 0:
+            return empty_df
+
+        # ── Inspect actual columns returned by WIBA ──────────────────────
+        print(f"  WIBA raw columns: {list(raw_df.columns)}")
+
+
+        col_map = {
+            # is_argument variants
+            "argument_prediction":   "is_argument",   # older WIBA versions
+            "is_arg":                "is_argument",
+            # argument_confidence variants
+            "confidence":            "argument_confidence",
+            "confidence_score":      "argument_confidence",
+            "argument_confidence_score": "argument_confidence",
+        }
+        raw_df = raw_df.rename(columns={k: v for k, v in col_map.items()
+                                         if k in raw_df.columns})
+
+        # If is_argument is a string ("Argument"/"NoArgument"), convert to bool
+        if "is_argument" in raw_df.columns:
+            if raw_df["is_argument"].dtype == object:
+                raw_df["is_argument"] = raw_df["is_argument"].isin(
+                    ["Argument", "argument", "True", "true", True]
+                )
+        else:
+            # Column still missing after rename — add it as all-False so downstream
+            # code doesn't crash; user will see 0 arguments and can investigate.
+            print("  Warning: could not find an 'is_argument' column in WIBA output. "
+                  "All segments will be treated as non-arguments.")
+            raw_df["is_argument"] = False
+
+        if "argument_confidence" not in raw_df.columns:
+            print("  Warning: could not find an 'argument_confidence' column. Defaulting to 0.0.")
+            raw_df["argument_confidence"] = 0.0
+
+        if "text_segment" not in raw_df.columns:
+            # Some versions use 'text' or 'segment'
+            for alt in ("text", "segment", "sentence"):
+                if alt in raw_df.columns:
+                    raw_df = raw_df.rename(columns={alt: "text_segment"})
+                    break
+            else:
+                print("  Warning: could not find a text column in WIBA output.")
+                raw_df["text_segment"] = ""
+
+        n_args = int(raw_df["is_argument"].sum())
+        print(f"✓ WIBA returned {len(raw_df)} segments ({n_args} arguments)")
+
+        return raw_df
+
+
+    def extract_arguments(self,
+                          results_df: pd.DataFrame,
+                          confidence_threshold: float = 0.5) -> List[str]:
+        self._wiba_results_df = results_df
+
+        if results_df is None or len(results_df) == 0:
+            self.arguments = []
+            return self.arguments
+
+        # Filter: is_argument=True AND confidence above threshold
+        mask = (
+            results_df["is_argument"].astype(bool) &
+            (results_df["argument_confidence"] >= confidence_threshold)
+        )
+        filtered = results_df[mask]
+
+        if len(filtered) == 0:
+            print(f"No arguments found above confidence threshold ({confidence_threshold})")
+            self.arguments = []
+            return self.arguments
+
+        print(f"Extracted {len(filtered)} arguments (confidence ≥ {confidence_threshold})")
+        self.arguments = filtered["text_segment"].tolist()
+        return self.arguments
+
+
     def process_text(self, text: str):
         """
-        Process text with Stanza (sentence tokenization).
-        
+        Store text for compatibility with old API.
+
         Args:
             text: Input text to analyze
         """
-        self.doc = self.nlp(text)
-        self.sentences = [sent.text.strip() for sent in self.doc.sentences 
-                         if sent.text.strip()]
-        
-    def detect_arguments(self, batch_delay: float = 0.05, max_retries: int = 3) -> List[str]:
-        """
-        Detect arguments using LLM (OpenAI API).
-        
-        Args:
-            batch_delay: Delay between API calls (seconds)
-            max_retries: Maximum retries for failed API calls
-            
-        Returns:
-            List of argument sentences
-        """
-        self.arguments = []
-        
-        for i, sent in enumerate(self.sentences):
-            # Check cache first
-            cache_key = sent.strip()
-            if cache_key in self.llm_cache:
-                if self.llm_cache[cache_key]['is_argument']:
-                    self.arguments.append(sent)
-                continue
-            
-            # Call LLM
-            for attempt in range(max_retries):
-                try:
-                    messages = [
-                        {"role": "system", "content": ARGUMENT_DETECTION_PROMPT},
-                        {"role": "user", "content": f"UNIT: {sent}"}
-                    ]
-                    
-                    response = self.llm_client.chat.completions.create(
-                        model=self.llm_model,
-                        messages=messages,
-                        temperature=self.llm_temperature,
-                        response_format={"type": "json_object"}
-                    )
-                    
-                    raw = response.choices[0].message.content.strip()
-                    result = json.loads(raw)
-                    
-                    is_arg = bool(result.get('is_argument', False))
-                    explanation = str(result.get('explanation', ''))
-                    
-                    # Cache result
-                    self.llm_cache[cache_key] = {
-                        'is_argument': is_arg,
-                        'explanation': explanation
-                    }
-                    
-                    if is_arg:
-                        self.arguments.append(sent)
-                    
-                    # Rate limiting
-                    time.sleep(batch_delay)
-                    break
-                    
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        print(f"Failed to classify sentence {i+1}/{len(self.sentences)}: {e}")
-                        # Default to False if all retries fail
-                        self.llm_cache[cache_key] = {
-                            'is_argument': False,
-                            'explanation': f'Error: {str(e)}'
-                        }
-                    else:
-                        time.sleep(1 * (attempt + 1))  # Exponential backoff
-        
-        return self.arguments
+        self._current_text = text
+        print(f"Text loaded: {len(text)} characters")
+
+
+
     def compute_argument_embeddings(self) -> np.ndarray:
-        """
-        Compute embeddings for detected arguments.
-        
-        Returns:
-            Array of argument embeddings with shape (N_args, embedding_dim)
-        """
+
         if not self.arguments:
-            raise ValueError("No arguments detected. Call detect_arguments_heuristic() first.")
-        
+            raise ValueError("No arguments detected. Call extract_arguments() first.")
+
         self.argument_embeddings = self.embedding_model.encode(self.arguments)
         return self.argument_embeddings
-    
-    def cluster_arguments(self, method: str = 'dbscan', n_clusters: Optional[int] = None) -> np.ndarray:
-        """
-        Cluster arguments based on their embeddings.
-        
-        Args:
-            method: Clustering method ('dbscan' or 'kmeans')
-            n_clusters: Number of clusters for kmeans (auto-detected for dbscan)
-            
-        Returns:
-            Array of cluster labels
-        """
+
+
+    def apply_umap(self, n_components: Optional[int] = None) -> np.ndarray:
+
         if self.argument_embeddings is None:
             self.compute_argument_embeddings()
-        
+
+        n_args = len(self.arguments)
+
+        if n_args < 15:
+            print(f"Skipping UMAP: only {n_args} arguments (need ≥15)")
+            self.umap_embeddings = self.argument_embeddings
+            return self.umap_embeddings
+
+        if n_components is None:
+            n_components = 10
+
+        max_components = min(self.argument_embeddings.shape[1], n_args - 1)
+        n_components = min(n_components, max_components)
+        n_neighbors = min(self.umap_n_neighbors, n_args - 1)
+
+        print(f"UMAP transformation: {self.argument_embeddings.shape} → ({n_args}, {n_components})")
+
+        self.umap_reducer = umap.UMAP(
+            n_components=n_components,
+            n_neighbors=n_neighbors,
+            min_dist=self.umap_min_dist,
+            metric=self.umap_metric,
+            random_state=42
+        )
+
+        self.umap_embeddings = self.umap_reducer.fit_transform(self.argument_embeddings)
+        print(f"UMAP complete: variance explained ≈ {self._estimate_variance_explained():.1%}")
+
+        return self.umap_embeddings
+
+    def _estimate_variance_explained(self) -> float:
+        """Estimate variance explained by UMAP (approximation)."""
+        if self.umap_embeddings is None or self.argument_embeddings is None:
+            return 0.0
+        original_var = np.var(self.argument_embeddings)
+        reduced_var = np.var(self.umap_embeddings)
+        return min(1.0, reduced_var / (original_var + 1e-10))
+
+
+    def cluster_arguments_hdbscan(self) -> np.ndarray:
+
+        if self.argument_embeddings is None:
+            self.compute_argument_embeddings()
+
         if len(self.arguments) < 2:
-            # Not enough arguments to cluster
             self.cluster_labels = np.array([0] * len(self.arguments))
+            self.clusterer = None
             return self.cluster_labels
-        
-        if method == 'dbscan':
-            # DBSCAN - automatically determines number of clusters
-            # eps is tuned for normalized embeddings
-            clustering = DBSCAN(eps=0.5, min_samples=self.min_cluster_size, metric='cosine')
-            self.cluster_labels = clustering.fit_predict(self.argument_embeddings)
-            
-            # Remove noise points (label = -1) by assigning them to nearest cluster
-            if -1 in self.cluster_labels:
-                noise_indices = np.where(self.cluster_labels == -1)[0]
-                valid_indices = np.where(self.cluster_labels != -1)[0]
-                
-                if len(valid_indices) > 0:
-                    for idx in noise_indices:
-                        # Find nearest valid cluster
-                        distances = np.linalg.norm(
-                            self.argument_embeddings[valid_indices] - self.argument_embeddings[idx],
-                            axis=1
-                        )
-                        nearest_valid_idx = valid_indices[np.argmin(distances)]
-                        self.cluster_labels[idx] = self.cluster_labels[nearest_valid_idx]
-                else:
-                    # All are noise - assign all to cluster 0
-                    self.cluster_labels = np.zeros(len(self.cluster_labels), dtype=int)
-        
-        elif method == 'kmeans':
-            if n_clusters is None:
-                # Auto-determine number of clusters (rule of thumb: sqrt(n/2))
-                n_clusters = max(2, int(np.sqrt(len(self.arguments) / 2)))
-            
-            n_clusters = min(n_clusters, len(self.arguments))
-            clustering = KMeans(n_clusters=n_clusters, random_state=42)
-            self.cluster_labels = clustering.fit_predict(self.argument_embeddings)
-        
+
+        if self.use_umap and len(self.arguments) >= 15:
+            embeddings_for_clustering = self.apply_umap()
+            print(f"Clustering with UMAP embeddings: {embeddings_for_clustering.shape}")
         else:
-            raise ValueError(f"Unknown clustering method: {method}")
-        
-        # Store cluster information
+            embeddings_for_clustering = self.argument_embeddings
+            print(f"Clustering with original embeddings: {embeddings_for_clustering.shape}")
+
+        self.clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=self.min_cluster_size,
+            min_samples=self.min_samples,
+            metric='euclidean' if embeddings_for_clustering is self.argument_embeddings else 'euclidean',
+            cluster_selection_epsilon=self.cluster_selection_epsilon,
+            cluster_selection_method='eom'
+        )
+
+        self.cluster_labels = self.clusterer.fit_predict(embeddings_for_clustering)
+
+        # Handle noise points (label = -1) by assigning to nearest cluster
+        if -1 in self.cluster_labels:
+            noise_indices = np.where(self.cluster_labels == -1)[0]
+            valid_indices = np.where(self.cluster_labels != -1)[0]
+
+            if len(valid_indices) > 0:
+                for idx in noise_indices:
+                    distances = np.linalg.norm(
+                        embeddings_for_clustering[valid_indices] - embeddings_for_clustering[idx],
+                        axis=1
+                    )
+                    nearest_valid_idx = valid_indices[np.argmin(distances)]
+                    self.cluster_labels[idx] = self.cluster_labels[nearest_valid_idx]
+            else:
+                self.cluster_labels = np.zeros(len(self.cluster_labels), dtype=int)
+
         self.clusters = {}
         for label in set(self.cluster_labels):
             indices = np.where(self.cluster_labels == label)[0]
@@ -267,20 +384,29 @@ class ArgumentAnalyzer:
                 'embeddings': self.argument_embeddings[indices],
                 'size': len(indices)
             }
-        
+
+        print(f"HDBSCAN found {len(self.clusters)} clusters")
         return self.cluster_labels
-    
+
+    def get_cluster_probabilities(self) -> Optional[np.ndarray]:
+        """Get soft cluster membership probabilities from HDBSCAN."""
+        if self.clusterer is None:
+            return None
+        return self.clusterer.probabilities_
+
+    def get_cluster_persistences(self) -> Optional[np.ndarray]:
+        """Get cluster persistence values (stability) from HDBSCAN."""
+        if self.clusterer is None:
+            return None
+        if hasattr(self.clusterer, 'cluster_persistence_'):
+            return self.clusterer.cluster_persistence_
+        return None
+
     def main_vs_fringe_perspective(self) -> Dict[str, float]:
-        """
-        Calculate main vs. fringe perspective ratio.
-        Formula: Main_ratio = max_c nc / Σ nc
-        
-        Returns:
-            Dictionary with main perspective metrics
-        """
+
         if self.clusters is None:
-            raise ValueError("No clusters found. Call cluster_arguments() first.")
-        
+            raise ValueError("No clusters found. Call cluster_arguments_hdbscan() first.")
+
         if len(self.clusters) == 0:
             return {
                 'main_ratio': 0.0,
@@ -289,18 +415,13 @@ class ArgumentAnalyzer:
                 'num_clusters': 0,
                 'fringe_clusters': 0
             }
-        
-        # Get cluster sizes
+
         cluster_sizes = [cluster['size'] for cluster in self.clusters.values()]
         total_args = sum(cluster_sizes)
         max_cluster_size = max(cluster_sizes)
-        
-        # Main ratio
         main_ratio = max_cluster_size / total_args if total_args > 0 else 0.0
-        
-        # Count fringe clusters (smaller than main)
         fringe_clusters = sum(1 for size in cluster_sizes if size < max_cluster_size)
-        
+
         return {
             'main_ratio': float(main_ratio),
             'main_cluster_size': int(max_cluster_size),
@@ -309,21 +430,14 @@ class ArgumentAnalyzer:
             'fringe_clusters': int(fringe_clusters),
             'fringe_ratio': float(1 - main_ratio)
         }
-    
+
     def argument_diversity(self) -> Dict[str, float]:
-        """
-        Calculate argument diversity.
-        Formula: Arg_diversity = K / log(1 + Narg)
-        
-        Returns:
-            Dictionary with diversity metrics
-        """
         if self.clusters is None:
-            raise ValueError("No clusters found. Call cluster_arguments() first.")
-        
+            raise ValueError("No clusters found. Call cluster_arguments_hdbscan() first.")
+
         n_args = len(self.arguments)
         k_clusters = len(self.clusters)
-        
+
         if n_args == 0:
             return {
                 'arg_diversity': 0.0,
@@ -331,15 +445,12 @@ class ArgumentAnalyzer:
                 'num_clusters': 0,
                 'cluster_entropy': 0.0
             }
-        
-        # Basic diversity metric
+
         diversity = k_clusters / np.log(1 + n_args)
-        
-        # Additional: cluster size distribution entropy
         cluster_sizes = [cluster['size'] for cluster in self.clusters.values()]
         cluster_probs = np.array(cluster_sizes) / sum(cluster_sizes)
         cluster_entropy = -np.sum(cluster_probs * np.log2(cluster_probs + 1e-10))
-        
+
         return {
             'arg_diversity': float(diversity),
             'num_arguments': int(n_args),
@@ -347,22 +458,12 @@ class ArgumentAnalyzer:
             'cluster_entropy': float(cluster_entropy),
             'normalized_diversity': float(diversity / np.log2(n_args + 1)) if n_args > 0 else 0.0
         }
-    
+
     def argument_distinctness(self) -> Dict[str, float]:
-        """
-        Calculate argument distinctness (Narrative Distinctness).
-        Formula: ND = √(d̄ · dmin)
-        
-        where:
-        - d̄ is the mean pairwise cosine distance between cluster centroids
-        - dmin is the minimum pairwise distance
-        
-        Returns:
-            Dictionary with distinctness metrics
-        """
+
         if self.clusters is None:
-            raise ValueError("No clusters found. Call cluster_arguments() first.")
-        
+            raise ValueError("No clusters found. Call cluster_arguments_hdbscan() first.")
+
         if len(self.clusters) < 2:
             return {
                 'narrative_distinctness': 0.0,
@@ -371,26 +472,22 @@ class ArgumentAnalyzer:
                 'max_distance': 0.0,
                 'num_clusters': len(self.clusters)
             }
-        
-        # Compute cluster centroids
+
         centroids = []
         for cluster in self.clusters.values():
             centroid = np.mean(cluster['embeddings'], axis=0)
             centroids.append(centroid)
-        
+
         centroids = np.array(centroids)
-        
-        # Compute pairwise cosine distances
+
         distances = []
         for i in range(len(centroids)):
             for j in range(i + 1, len(centroids)):
-                # Cosine distance = 1 - cosine similarity
                 cos_sim = np.dot(centroids[i], centroids[j]) / (
                     np.linalg.norm(centroids[i]) * np.linalg.norm(centroids[j])
                 )
-                distance = 1 - cos_sim
-                distances.append(distance)
-        
+                distances.append(1 - cos_sim)
+
         if not distances:
             return {
                 'narrative_distinctness': 0.0,
@@ -399,14 +496,12 @@ class ArgumentAnalyzer:
                 'max_distance': 0.0,
                 'num_clusters': len(self.clusters)
             }
-        
+
         mean_dist = np.mean(distances)
         min_dist = np.min(distances)
         max_dist = np.max(distances)
-        
-        # Narrative Distinctness (ND)
         nd = np.sqrt(mean_dist * min_dist)
-        
+
         return {
             'narrative_distinctness': float(nd),
             'mean_distance': float(mean_dist),
@@ -415,127 +510,127 @@ class ArgumentAnalyzer:
             'num_clusters': len(self.clusters),
             'std_distance': float(np.std(distances))
         }
-    
+
     def deliberation_intensity(self) -> Dict[str, float]:
-        """
-        Calculate deliberation intensity.
-        
-        Formula: Delib_intensity = (Ddiv + Dnd) / 2
-        
-        where:
-        - Ddiv is normalized argument diversity [0, 1]
-        - Dnd is normalized narrative distinctness [0, 1]
-        
-        This metric combines argument diversity and distinctness to measure
-        the overall quality of deliberation in the text.
-        
-        Returns:
-            Dictionary with deliberation intensity metrics
-        """
+
         if self.clusters is None:
-            raise ValueError("No clusters found. Call cluster_arguments() first.")
-        
-        # Get diversity and distinctness
+            raise ValueError("No clusters found. Call cluster_arguments_hdbscan() first.")
+
         diversity = self.argument_diversity()
         distinctness = self.argument_distinctness()
-        
-        # Normalize diversity (already has normalized_diversity)
+
         ddiv = diversity.get('normalized_diversity', 0.0)
-        
-        # Normalize distinctness (ND is already in [0, 1] range approximately)
-        # ND = sqrt(mean * min) where mean, min ∈ [0, 1] for cosine distance
         dnd = distinctness.get('narrative_distinctness', 0.0)
-        
-        # Deliberation intensity
         delib_intensity = (ddiv + dnd) / 2.0
-        
+
         return {
             'deliberation_intensity': float(delib_intensity),
             'diversity_component': float(ddiv),
-            'distinctness_component': float(dnd),
-            'interpretation': self._interpret_deliberation(delib_intensity)
+            'distinctness_component': float(dnd)
         }
-    
-    def _interpret_deliberation(self, intensity: float) -> str:
-        """
-        Provide interpretation of deliberation intensity score.
-        
-        Args:
-            intensity: Deliberation intensity value [0, 1]
-            
-        Returns:
-            Interpretation string
-        """
-        if intensity >= 0.7:
-            return "High deliberation quality - diverse and distinct arguments"
-        elif intensity >= 0.5:
-            return "Moderate deliberation quality - some diversity and distinction"
-        elif intensity >= 0.3:
-            return "Low deliberation quality - limited diversity or distinction"
-        else:
-            return "Very low deliberation quality - minimal argumentative structure"
-    
-    def get_all_metrics(self, clustering_method: str = 'dbscan', **detection_kwargs) -> Dict:
-        """
-        Compute all argument metrics.
-        
-        Args:
-            clustering_method: 'dbscan' or 'kmeans'
-            **detection_kwargs: Additional arguments for argument detection
-                batch_delay: Delay between API calls (default: 0.05)
-                max_retries: Maximum retries (default: 3)
-            
-        Returns:
-            Dictionary with all argument metrics
-        """
-        # Step 1: Detect arguments using LLM
-        self.detect_arguments(**detection_kwargs)
-        
+
+
+
+    def get_all_metrics(self,
+                        text: Optional[str] = None,
+                        results_df: Optional[pd.DataFrame] = None,
+                        window_size: int = 3,
+                        step_size: int = 1,
+                        confidence_threshold: float = 0.5,
+                        **kwargs) -> Dict:
+
+        # Resolve text source
+        if text is None and results_df is None:
+            if self._current_text is not None:
+                text = self._current_text
+            else:
+                raise ValueError(
+                    "Must provide either text, results_df, or call process_text() first"
+                )
+
+        # Step 1: Discover arguments via WIBA
+        if results_df is None:
+            results_df = self.discover_arguments(
+                text, window_size=window_size, step_size=step_size
+            )
+
+        # Step 2: Extract arguments (WIBA already resolved overlaps)
+        self.extract_arguments(results_df, confidence_threshold=confidence_threshold)
+
+        num_windows = len(results_df)
+
         if len(self.arguments) == 0:
             return {
                 'num_arguments': 0,
-                'num_sentences': len(self.sentences),
+                'num_windows': num_windows,
                 'argumentativeness': 0.0,
-                'llm_model': self.llm_model,
-                'main_vs_fringe': {
-                    'main_ratio': 0.0,
-                    'num_clusters': 0
-                },
-                'argument_diversity': {
-                    'arg_diversity': 0.0,
-                    'num_clusters': 0
-                },
-                'argument_distinctness': {
-                    'narrative_distinctness': 0.0,
-                    'num_clusters': 0
-                },
-                'deliberation_intensity': {
-                    'deliberation_intensity': 0.0,
-                    'interpretation': 'No arguments detected'
-                }
+                'backend': 'WIBA + HDBSCAN',
+                'arguments': [],           # always present so callers never get KeyError
+                'argument_details': [],
+                'main_vs_fringe': {'main_ratio': 0.0, 'num_clusters': 0},
+                'argument_diversity': {'arg_diversity': 0.0, 'num_clusters': 0},
+                'argument_distinctness': {'narrative_distinctness': 0.0, 'num_clusters': 0},
+                'deliberation_intensity': {'deliberation_intensity': 0.0}
             }
-        
-        # Step 2: Embed arguments
+
+        # Step 3: Embed arguments
         self.compute_argument_embeddings()
-        
-        # Step 3: Cluster arguments
-        self.cluster_arguments(method=clustering_method)
-        
-        # Step 4: Compute metrics
+
+        # Step 4: Cluster with HDBSCAN
+        self.cluster_arguments_hdbscan()
+
+        # Step 5: Compute metrics
         main_fringe = self.main_vs_fringe_perspective()
         diversity = self.argument_diversity()
         distinctness = self.argument_distinctness()
         delib_intensity = self.deliberation_intensity()
-        
-        # Argumentativeness
-        argumentativeness = len(self.arguments) / len(self.sentences) if len(self.sentences) > 0 else 0.0
-        
+
+        argumentativeness = len(self.arguments) / num_windows if num_windows > 0 else 0.0
+
+        probabilities = self.get_cluster_probabilities()
+        avg_probability = float(np.mean(probabilities)) if probabilities is not None else None
+
+        umap_info = None
+        if self.umap_embeddings is not None:
+            umap_info = {
+                'applied': True,
+                'original_dim': self.argument_embeddings.shape[1],
+                'reduced_dim': self.umap_embeddings.shape[1],
+                'variance_explained': self._estimate_variance_explained()
+            }
+        elif self.use_umap and len(self.arguments) < 15:
+            umap_info = {
+                'applied': False,
+                'reason': f'Too few arguments ({len(self.arguments)} < 15)'
+            }
+
+        # Enrich argument list with WIBA comprehensive fields if available
+        argument_details = []
+        if self._wiba_results_df is not None:
+            wiba_args = self._wiba_results_df[
+                self._wiba_results_df["is_argument"].astype(bool) &
+                (self._wiba_results_df["argument_confidence"] >= confidence_threshold)
+            ]
+            for _, row in wiba_args.iterrows():
+                detail = {"text": row["text_segment"]}
+                for col in ["claims", "premises", "topic_fine", "topic_broad",
+                            "stance_fine", "stance_broad", "argument_type", "argument_scheme"]:
+                    if col in row:
+                        detail[col] = row[col]
+                argument_details.append(detail)
+
         return {
             'num_arguments': len(self.arguments),
-            'num_sentences': len(self.sentences),
+            'num_windows': num_windows,
             'argumentativeness': float(argumentativeness),
-            'llm_model': self.llm_model,
-            'arguments': self.arguments,  # Include actual arguments for inspection
+            'backend': 'WIBA + HDBSCAN' + (' + UMAP' if self.umap_embeddings is not None else ''),
+            'arguments': self.arguments,
+            'argument_details': argument_details,  # Full WIBA comprehensive fields per argument
+            'umap': umap_info,
+            'cluster_quality': {
+                'avg_membership_probability': avg_probability,
+                'num_stable_clusters': len(self.clusters)
+            },
             'main_vs_fringe': main_fringe,
             'argument_diversity': diversity,
             'argument_distinctness': distinctness,
