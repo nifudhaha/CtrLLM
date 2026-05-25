@@ -90,6 +90,7 @@ class EntityAnalyzer:
         
         # Consolidate entity types
         person_count = entity_types.get('PERSON', 0)
+        date_count = entity_types.get('DATE', 0) + entity_types.get('TIME', 0)
         org_count = entity_types.get('ORG', 0) + entity_types.get('ORGANIZATION', 0)
         location_count = (entity_types.get('GPE', 0) + 
                          entity_types.get('LOC', 0) + 
@@ -103,6 +104,7 @@ class EntityAnalyzer:
             'person_count': person_count,
             'org_count': org_count,
             'location_count': location_count
+            'date_count': date_count
         }
     
     def get_all_metrics(self) -> Dict:
