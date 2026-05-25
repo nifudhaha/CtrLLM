@@ -26,17 +26,6 @@ def _fmt_exc(e: Exception) -> str:
 
 
 class RuleBasedAnalyzer:
-    """
-    Analyzes text using rule-based metrics with LLM assistance:
-
-    1. Balanced Pro/Con
-    2. Narrative Roles
-    3. Harm Index
-    4. Devil–Angel Shift
-    5. Interactivity (Binary + Ratio)
-    6. Text Polarization (Stakeholder-based Bias)
-    """
-
 
     def __init__(self,
                  llm_model: str = "gpt-4o-mini",
