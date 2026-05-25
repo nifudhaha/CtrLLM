@@ -4,7 +4,7 @@
 
 **Controversial Topic Representation in LLM**
 
-A comprehensive Python package for analyzing text diversity, bias, and controversial topic representation in language models.
+A comprehensive Python package for analyzing text diversity and controversial topic representation in language models.
 
 ---
 
@@ -14,9 +14,8 @@ This toolkit helps researchers and developers analyze how different sources (Wik
 
 - **Text diversity** (vocabulary, semantic, lexical)
 - **Perspective multiplexity** (multiple viewpoints)
-- **Bias detection** (single vs. multi-perspective)
 - **Content quality** (complexity, richness)
-- **Rule-based discourse framing** (balance, narrative roles, harm)
+- **Rule-based discourse framing** (balance framing, narrative roles)
 
 ---
 
