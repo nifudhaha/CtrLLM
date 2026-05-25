@@ -17,18 +17,18 @@ class TextMetrics:
     Main class for computing comprehensive text metrics.
     
     Integrates all analysis modules:
-    - Syntactic (POS, entropy, lexical richness)
-    - Semantic (embeddings, similarity)
-    - Entity (named entities, specificity)
-    - Sentiment (emotional variance)
-    - Argument (perspective diversity, argumentation)
-    - Rule-based (stance, narrative roles, harm detection)
+    - Syntactic 
+    - Semantic 
+    - Entity 
+    - Sentiment 
+    - Argument 
+    - Rule-based 
     """
     
     def __init__(self,
                  lang: str = "en",
-                 embedding_model: str = "all-MiniLM-L6-v2",
-                 sentiment_model: str = "distilbert-base-uncased-finetuned-sst-2-english",
+                 embedding_model: str = "all-mpnet-base-v2",
+                 sentiment_model: str = "siebert/sentiment-roberta-large-english",
                  enable_rule_based: bool = True):
         """
         Initialize text metrics calculator.
@@ -62,10 +62,10 @@ class TextMetrics:
     def compute_all(self,
                     text: str,
                     include_syntactic: bool = True,
-                    include_semantic: bool = False,
-                    include_entity: bool = False,
-                    include_sentiment: bool = False,
-                    include_argument: bool = False,
+                    include_semantic: bool = True,
+                    include_entity: bool = True,
+                    include_sentiment: bool = True,
+                    include_argument: bool = True,
                     include_rule_based: bool = True) -> Dict:
         """
         Compute all available metrics for the given text.
@@ -174,9 +174,9 @@ class TextMetrics:
         return self.compute_all(
             text,
             include_syntactic=True,
-            include_semantic=False,
-            include_entity=False,
-            include_sentiment=False
+            include_semantic=True,
+            include_entity=True,
+            include_sentiment=True
         )
     
     def compute_semantic(self, text: str) -> Dict:
