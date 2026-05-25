@@ -138,7 +138,24 @@ Classifies entities into narrative roles:
 - **Save/Load** - Pickle serialization
 
 ---
-
+ 
+#### **3. Interactivity (Stakeholder's Claim)**
+Detects sentences that **attribute claims to specific sources** — i.e. quotes, citations, or reported speech — rather than presenting facts directly.
+ 
+Examples of interactive sentences:
+- *"According to the WHO, the virus spreads through droplets."*
+- *"The CEO stated that layoffs were unavoidable."*
+- *"Critics argue the policy will increase inequality."*
+**Uses LLM-based detection** (requires OpenAI API)
+ 
+**Outputs:**
+- `interactive` — binary flag (1 if any interactive sentence found)  
+- `interactive_ratio` — proportion of sentences with source attribution  
+- `num_interactive_sentences` — count of attributed sentences  
+- `total_citations` — total citation phrases extracted  
+- `interaction_cues` — list of all citation phrases found  
+- `sentence_breakdown` — per-sentence detail with extracted citation phrases  
+---
 ## 💻 Usage Examples
 
 ### Example 1: Full Analysis
