@@ -22,7 +22,6 @@ This toolkit helps researchers and developers analyze how different sources (Wik
 ## 🚀 Quick Start
 
 ### Installation
-
 ```bash
 # Install package
 pip install -e .
@@ -32,10 +31,18 @@ pip install -r requirements.txt
 
 # Download Stanza models
 python -c "import stanza; stanza.download('en')"
+```
 
-# Set OpenAI API key for LLM-based analysis
+### API Keys
+This package relies on two external APIs:
+
+```bash
+# OpenAI — for LLM-based analysis (narrative roles, balanced pros and cons, stakeholder's claims)
 export OPENAI_API_KEY='your-openai-api-key'
 
+# Set WIBA API token for argument detection
+# You can get an API key at https://wiba.dev/
+export WIBA_API_TOKEN='your-wiba-api-token'
 ```
 
 ### Basic Usage
